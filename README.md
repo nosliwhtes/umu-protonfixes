@@ -296,6 +296,14 @@ cd ..
 python -m protonfixes.protonfixes_test
 ```
 
+From this directory, the dependency-free smoke test is:
+
+```bash
+python gamefixes_smoke_test.py
+```
+
+It parses every gamefix and fails if one has no `main`/`early` or still uses CRLF.
+
 ### Disable ProtonFixes (for advanced users only)
 If you want to disable the ProtonFixes system for any reason (for example, to test if a game works without the current fix), you can do it by using the env. var. `PROTONFIXES_DISABLE=1`.
 
