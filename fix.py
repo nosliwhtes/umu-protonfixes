@@ -156,7 +156,7 @@ def _run_fix(
         elif stage == 'main':
             if hasattr(game_module, 'main_with_id'):
                 game_module.main_with_id(game_id)
-            else:
+            elif hasattr(game_module, 'main'):
                 game_module.main()
     except ImportError:
         log.info(
