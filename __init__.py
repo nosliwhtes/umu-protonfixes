@@ -67,7 +67,11 @@ def execute_early() -> None:
         log.warn('Skipping fix execution. We are probably running a unit test.')
     else:
         check_verb_requirements()
-        fix.early()
+        try:
+            fix.early()
+        except Exception:
+            sys.stderr.write('ProtonFixes ' + traceback.format_exc())
+            sys.stderr.flush()
 
 
 execute_early()
