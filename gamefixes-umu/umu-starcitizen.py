@@ -22,8 +22,9 @@ def main() -> None:
     # New launcher needs dotnet48
     util.protontricks('dotnet48')
 
-    # Reset version to win10
-    util.protontricks('win10')
+    # dotnet48 can set win7 without recording a version verb. An older win10
+    # log entry therefore cannot prove that the prefix is still Windows 10.
+    util.protontricks('win10', force=True)
 
     # Prevent RSI Launcher install and update from hanging indefinitely
     util.winedll_override('dxwebsetup.exe', util.OverrideOrder.DISABLED)

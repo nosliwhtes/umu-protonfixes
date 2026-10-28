@@ -320,9 +320,9 @@ def check_internet() -> bool:
         return False
 
 
-def protontricks(verb: str) -> bool:
-    """Runs winetricks if available"""
-    if not checkinstalled(verb):
+def protontricks(verb: str, force: bool = False) -> bool:
+    """Runs winetricks if available; force bypasses the installed-verb log check."""
+    if force or not checkinstalled(verb):
         if check_internet():
             # Proceed with your function logic here
             pass

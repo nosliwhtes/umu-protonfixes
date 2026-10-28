@@ -1,11 +1,13 @@
 import os
+import importlib
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from pathlib import Path
-from unittest.mock import patch, mock_open
+from unittest.mock import Mock, patch, mock_open
 
-from . import fix
+from . import fix, util
 
 
 class TestProtonfixes(unittest.TestCase):
@@ -405,6 +407,76 @@ class TestProtonfixes(unittest.TestCase):
         os.environ['STORE'] = 'gog'
         result = fix.get_game_title(self.db.as_posix())
         self.assertEqual(result, 'UNKNOWN')
+
+class TestStarCitizenWindowsVersion(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.prefix = Path(self.directory.name)
+        (self.prefix / 'drive_c/windows/system32').mkdir(parents=True)
+        self.log = self.prefix / 'winetricks.log'
+        self.log.write_text('powershell\nvcrun2022\ndotnet40\nwin10\n', encoding='ascii')
+        self.winver = 'win10'
+        self.commands = []
+        self.returncode = 0
+        proton = SimpleNamespace(
+            g_session=SimpleNamespace(env={}),
+            g_proton=SimpleNamespace(wine_bin='wine', wineserver_bin='wineserver'),
+        )
+        for target, kwargs in (
+            ('protonprefix', {'return_value': self.prefix}),
+            ('protonmain', {'new': proton}),
+            ('check_internet', {'return_value': True}),
+            ('is_custom_verb', {'return_value': False}),
+            ('_killhanging', {}),
+            ('winedll_override', {}),
+        ):
+            patcher = patch.object(util, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for target, kwargs in (
+            ('call', {'return_value': 0}),
+            ('Popen', {'side_effect': self.run_winetricks}),
+        ):
+            patcher = patch.object(util.subprocess, target, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_winetricks(self, command, **kwargs):
+        verb = command[-1]
+        self.commands.append(verb)
+        if not self.returncode:
+            if verb == 'dotnet48':
+                # Pinned winetricks sets win7 directly; already-installed dotnet40
+                # adds no version verb, leaving the old win10 entry in the log.
+                self.winver = 'win7'
+            elif verb == 'win10':
+                self.winver = 'win10'
+            with self.log.open('a', encoding='ascii') as stream:
+                stream.write(verb + '\n')
+        process = Mock(returncode=self.returncode)
+        process.__enter__ = Mock(return_value=process)
+        process.__exit__ = Mock(return_value=False)
+        return process
+
+    def test_upgraded_prefix_resets_actual_version_despite_stale_win10_log(self):
+        gamefix = importlib.import_module('.gamefixes-umu.umu-starcitizen', __package__)
+        gamefix.main()
+        self.assertEqual(self.commands, ['dotnet48', 'win10'])
+        self.assertEqual(self.winver, 'win10')
+
+    def test_installed_verbs_still_skip_without_force(self):
+        self.assertFalse(util.protontricks('powershell'))
+        self.assertFalse(util.protontricks('win10'))
+        self.assertEqual(self.commands, [])
+
+    def test_forced_reset_reports_execution_failure(self):
+        self.returncode = 1
+        self.winver = 'win7'
+        self.assertFalse(util.protontricks('win10', force=True))
+        self.assertEqual(self.commands, ['win10'])
+        self.assertEqual(self.winver, 'win7')
+
 
 if __name__ == '__main__':
     unittest.main()
