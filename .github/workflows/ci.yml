@@ -68,3 +68,4 @@ jobs:
         run: |
           cd ..
           python3 -m protonfixes.protonfixes_test
+          python3 -m protonfixes.upscalers_test

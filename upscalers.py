@@ -5,7 +5,9 @@ import hashlib
 import json
 import lzma
 import os
+import shutil
 import tarfile
+import tempfile
 import urllib.request
 from functools import lru_cache
 from urllib.error import HTTPError, URLError
@@ -243,8 +245,33 @@ def __set_tracked_items(compat_dir: str, section: str, checksums: dict) -> None:
 
     local_versions[section] = checksums
 
-    with open(tracking_file, 'w', encoding='utf-8') as file_fd:
-        file_fd.write(json.dumps(local_versions))
+    # A failed write must not truncate the previous installation's record.
+    with tempfile.NamedTemporaryFile(
+        mode='w', encoding='utf-8', dir=compat_dir, delete=False
+    ) as file_fd:
+        temp = Path(file_fd.name)
+        try:
+            file_fd.write(json.dumps(local_versions))
+            file_fd.close()
+            temp.replace(tracking_file)
+        finally:
+            temp.unlink(missing_ok=True)
+
+
+def __safe_path(root: Path, name: str) -> Path:
+    """Validate a nonempty relative path without following directory symlinks"""
+    relative = Path(name)
+    if not relative.parts or relative.is_absolute() or '..' in relative.parts:
+        raise ValueError(f'Unsafe component path: {name!r}')
+    target = root / relative
+    if not target.resolve().is_relative_to(root):
+        raise ValueError(f'Component path escapes destination: {name!r}')
+    for parent in target.parents:
+        if parent == root:
+            break
+        if parent.is_symlink():
+            raise ValueError(f'Symlink in component directory path: {name!r}')
+    return target
 
 
 def __check_upscaler_file(
@@ -354,9 +381,20 @@ def __check_component_files(
     ignore_version: ignore version mismatch but still check if the files are present
     """
     try:
+        prefix = Path(prefix_dir).resolve()
+        component = __safe_path(prefix, path)
+        if component.is_symlink():
+            raise ValueError(f'Symlink component destination: {component}')
         tracked_items = __get_tracked_items(compat_dir, section)
+        remote_hashes = {
+            str(__safe_path(component, name).relative_to(prefix)): checksum
+            for name, checksum in remote_item['md5_hash'].items()
+        }
+        targets = {name: __safe_path(prefix, name) for name in tracked_items}
+        if any(not target.is_relative_to(component) for target in targets.values()):
+            raise ValueError('Tracked path outside component')
         # test if new files and their attributes exist in the tracking file
-        for dst in [os.path.join(path, f) for f in remote_item['md5_hash']]:
+        for dst in remote_hashes:
             _ = tracked_items[dst].get('md5_hash')
     except Exception as e:
         log.warn(str(e))
@@ -364,7 +402,7 @@ def __check_component_files(
 
     dst_hashes = {}
     for dst in tracked_items:
-        target = os.path.join(prefix_dir, dst)
+        target = targets[dst]
         if not os.path.isfile(target):
             log.warn(f'Missing file from prefix "{dst}"')
             return False
@@ -377,16 +415,14 @@ def __check_component_files(
         dst_hashes.update({dst: dst_md5})
 
     if not ignore_version:
-        for name in remote_item['md5_hash']:
-            dst = os.path.join(path, name)
-            target = os.path.join(prefix_dir, dst)
+        for dst, item_md5 in remote_hashes.items():
+            target = targets[dst]
             if not os.path.isfile(target):
                 log.warn(f'Missing file from prefix "{dst}"')
                 return False
             if tracked_items[dst]['version'] != remote_item['version']:
                 log.warn(f'Version mismatch between configuration and prefix "{dst}"')
                 return False
-            item_md5 = remote_item['md5_hash'][name]
             if item_md5 and dst_hashes[dst] != item_md5.lower():
                 log.warn(f'MD5 checksum mismatch between manifest and prefix "{dst}"')
                 return False
@@ -558,6 +594,136 @@ def download_upscaler(
         log.crit(str(e))
 
 
+def __stage_component(archive: Path, stage: Path) -> list[Path]:
+    """Stage files and internal DLL aliases without extracting archive paths"""
+    members: dict[Path, tarfile.TarInfo] = {}
+    with tarfile.open(archive, 'r:xz') as tar_fd:
+        for member in tar_fd.getmembers():
+            # Some producers include a harmless root directory entry.
+            if member.isdir() and Path(member.name) == Path('.'):
+                continue
+            target = __safe_path(stage, member.name)
+            relative = target.relative_to(stage)
+            if relative in members:
+                raise ValueError(f'Duplicate archive path: {member.name!r}')
+            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise ValueError(f'Unsupported archive member: {member.name!r}')
+            if member.issparse():
+                raise ValueError(f'Sparse archive member: {member.name!r}')
+            members[relative] = member
+
+        # Validate links before writing anything. Only direct links to regular
+        # archived files are needed by component packages (e.g. OptiScaler).
+        for relative, member in members.items():
+            if member.issym() or member.islnk():
+                link = __safe_path(stage, member.linkname).relative_to(stage)
+                if member.issym():
+                    link = relative.parent / link
+                linked = members.get(link)
+                if linked is None or not linked.isfile():
+                    raise ValueError(f'Invalid archive link: {member.name!r}')
+
+        for relative, member in members.items():
+            target = stage / relative
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif member.isfile():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source = tar_fd.extractfile(member)
+                if source is None:
+                    raise ValueError(f'Missing archive data: {member.name!r}')
+                with source, target.open('xb') as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod(member.mode & 0o777)
+
+        for relative, member in members.items():
+            target = stage / relative
+            if member.issym() or member.islnk():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if member.issym():
+                    target.symlink_to(member.linkname)
+                else:
+                    os.link(stage / member.linkname, target)
+
+    return [relative for relative, member in members.items() if not member.isdir()]
+
+
+def __install_component(
+    prefix: Path, component: Path, stage: Path, files: list[Path],
+    tracked: dict, compat_dir: str, section: str, version: dict,
+) -> None:
+    """Replace a validated package, restoring files if installation fails"""
+    targets = [__safe_path(component, str(relative)) for relative in files]
+    obsolete = []
+    for name in tracked:
+        target = __safe_path(prefix, name)
+        if not target.is_relative_to(component):
+            raise ValueError(f'Tracked path outside component: {name!r}')
+        if not name.endswith('.ini'):
+            obsolete.append(target)
+
+    ini_backups = {
+        target: __safe_path(component, str(target.relative_to(component)) + '.old')
+        for target in targets
+        if target.suffix == '.ini' and (target.exists() or target.is_symlink())
+    }
+    if set(ini_backups.values()).intersection(targets):
+        raise ValueError('Archive would overwrite an INI backup')
+    affected = set(targets + obsolete + list(ini_backups.values()))
+    for target in affected:
+        if target.exists() and not target.is_file():
+            raise ValueError(f'Not a regular component file: {target}')
+
+    # Put the journal on the prefix filesystem so moves can be undone without
+    # copying DLL contents. If rollback itself fails, retain it for recovery.
+    backup_dir = Path(tempfile.mkdtemp(prefix='.upscaler-backup-', dir=prefix))
+    backups: dict[Path, Path] = {}
+    installed: list[Path] = []
+    created_dirs: list[Path] = []
+    try:
+        directories = {
+            __safe_path(component, str(directory.relative_to(stage)))
+            for directory in stage.rglob('*') if directory.is_dir()
+        }
+        for target in targets:
+            for parent in target.parents:
+                if parent == prefix:
+                    break
+                directories.add(parent)
+        for directory in sorted(directories, key=lambda value: len(value.parts)):
+            if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+                raise ValueError(f'Not a component directory: {directory}')
+            if not directory.exists():
+                directory.mkdir()
+                created_dirs.append(directory)
+        for target in sorted(affected):
+            if target.exists() or target.is_symlink():
+                backup = backup_dir / target.relative_to(prefix)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                target.replace(backup)
+                backups[target] = backup
+        for target, old in ini_backups.items():
+            installed.append(old)
+            shutil.copy2(backups[target], old, follow_symlinks=False)
+        for relative, target in zip(files, targets):
+            (stage / relative).replace(target)
+            installed.append(target)
+        __set_tracked_items(compat_dir, section, version)
+    except Exception:
+        try:
+            for target in reversed(installed):
+                target.unlink(missing_ok=True)
+            for target, backup in backups.items():
+                backup.replace(target)
+            for directory in reversed(created_dirs):
+                directory.rmdir()
+        except Exception as rollback_error:
+            raise RuntimeError(f'Component rollback failed; backups retained in {backup_dir}') from rollback_error
+        shutil.rmtree(backup_dir)
+        raise
+    shutil.rmtree(backup_dir)
+
+
 def __download_component_files(
     compat_dir: str,
     prefix_dir: str,
@@ -565,18 +731,27 @@ def __download_component_files(
     item: dict,
     section: str,
 ) -> bool:
-    """Check for optiscaler files and their versions
-
-    version: the version of the upscaler dll to download
-    """
+    """Validate and stage a component before changing the installed version"""
     try:
         tracked_items = __get_tracked_items(compat_dir, section)
     except Exception:
         tracked_items = {}
-        pass
 
     try:
         log.info(f'Updating {item["file_description"]} to "{item["version"]}"')
+        prefix = Path(prefix_dir).resolve()
+        component = __safe_path(prefix, path)
+        if component.is_symlink():
+            raise ValueError(f'Symlink component destination: {component}')
+        if not item['md5_hash']:
+            raise ValueError('Component manifest contains no files')
+        version = {}
+        for name, checksum in item['md5_hash'].items():
+            target = __safe_path(component, name)
+            key = str(target.relative_to(prefix))
+            if key in version:
+                raise ValueError(f'Duplicate manifest path: {name!r}')
+            version[key] = {'version': item['version'], 'md5_hash': checksum}
 
         url_path = Path(unquote(urlparse(item['download_url']).path))
         cache_dir = config.path.cache_dir.joinpath('upscalers')
@@ -584,35 +759,25 @@ def __download_component_files(
         cached_file = cache_dir.joinpath(url_path.name)
         __cached_download(item, cached_file)
 
-        for target in tracked_items:
-            # do not remove .ini files
-            if target.endswith('.ini'):
-                continue
-            local_file = os.path.join(prefix_dir, target)
-            if os.path.exists(local_file):
-                os.unlink(local_file)
-
-        with tarfile.open(cached_file, 'r:xz') as tar_fd:
-            names = tar_fd.getnames()
-            for name in names:
-                local_file = os.path.join(prefix_dir, path, name)
-                if name.endswith('.ini') and os.path.exists(local_file):
-                    os.rename(local_file, local_file + '.old' )
-                tar_fd.extract(name, os.path.join(prefix_dir, path))
-
-        version = {}
-        for name in item['md5_hash']:
-            version[os.path.join(path, name)] = {
-                'version': item['version'],
-                'md5_hash': item['md5_hash'][name]
-            }
-
+        with tempfile.TemporaryDirectory(prefix='.upscaler-stage-', dir=prefix) as temp:
+            stage = Path(temp)
+            files = __stage_component(cached_file, stage)
+            for name, checksum in item['md5_hash'].items():
+                target = __safe_path(stage, name)
+                if not target.is_file():
+                    raise ValueError(f'Missing component file: {name!r}')
+                with target.open('rb') as source:
+                    digest = hashlib.md5(source.read()).hexdigest()
+                if checksum and digest != checksum.lower():
+                    raise ValueError(f'Component checksum mismatch: {name!r}')
+            __install_component(
+                prefix, component, stage, files, tracked_items,
+                compat_dir, section, version,
+            )
     except Exception as e:
         log.crit(f'Failed to download "{item["file_description"]}" package.')
         log.crit(str(e))
         return False
-
-    __set_tracked_items(compat_dir, section, version)
     return True
 
 
@@ -708,7 +873,7 @@ def clean_tracked_files(
     prefix_dir: str,
 ) -> bool:
     try:
-        _, section = __get_items(name, 'default')
+        items, section = __get_items(name, 'default')
     except Exception:
         return False
 
@@ -716,17 +881,26 @@ def clean_tracked_files(
 
     try:
         tracked_items = __get_tracked_items(compat_dir, section)
-    except Exception:
+        prefix = Path(prefix_dir).resolve()
+        targets = [__safe_path(prefix, path) for path in tracked_items]
+        if isinstance(items, tuple):
+            component = __safe_path(prefix, items[0])
+            if component.is_symlink() or any(
+                not target.is_relative_to(component) for target in targets
+            ):
+                raise ValueError('Tracked path outside component')
+        elif any(path not in items for path in tracked_items):
+            raise ValueError('Unexpected tracked upscaler path')
+    except Exception as e:
+        log.warn(str(e))
         return False
 
-    __set_tracked_items(compat_dir, section, {})
-
-    for path in tracked_items:
-        file = os.path.join(prefix_dir, path)
-        if os.path.exists(file):
+    for file in targets:
+        if file.exists() or file.is_symlink():
             log.debug(f'Removing {file}')
-            os.unlink(file)
+            file.unlink()
 
+    __set_tracked_items(compat_dir, section, {})
     return True
 
 
