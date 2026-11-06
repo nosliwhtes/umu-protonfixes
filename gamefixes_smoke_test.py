@@ -11,7 +11,7 @@ STORE_DIRS = sorted(ROOT.glob('gamefixes-*'))
 STAGES = {'main', 'early', 'main_with_id', 'early_with_id'}
 
 
-def gamefix_files():
+def gamefix_files() -> list[Path]:
     """Return gamefix modules, skipping package markers."""
     files = []
     for store in STORE_DIRS:
