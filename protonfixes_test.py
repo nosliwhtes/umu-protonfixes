@@ -423,22 +423,16 @@ class TestStarCitizenWindowsVersion(unittest.TestCase):
             g_session=SimpleNamespace(env={}),
             g_proton=SimpleNamespace(wine_bin='wine', wineserver_bin='wineserver'),
         )
-        for target, kwargs in (
-            ('protonprefix', {'return_value': self.prefix}),
-            ('protonmain', {'new': proton}),
-            ('check_internet', {'return_value': True}),
-            ('is_custom_verb', {'return_value': False}),
-            ('_killhanging', {}),
-            ('winedll_override', {}),
+        for patcher in (
+            patch.object(util, 'protonprefix', return_value=self.prefix),
+            patch.object(util, 'protonmain', new=proton),
+            patch.object(util, 'check_internet', return_value=True),
+            patch.object(util, 'is_custom_verb', return_value=False),
+            patch.object(util, '_killhanging'),
+            patch.object(util, 'winedll_override'),
+            patch.object(util.subprocess, 'call', return_value=0),
+            patch.object(util.subprocess, 'Popen', side_effect=self.run_winetricks),
         ):
-            patcher = patch.object(util, target, **kwargs)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        for target, kwargs in (
-            ('call', {'return_value': 0}),
-            ('Popen', {'side_effect': self.run_winetricks}),
-        ):
-            patcher = patch.object(util.subprocess, target, **kwargs)
             patcher.start()
             self.addCleanup(patcher.stop)
 
